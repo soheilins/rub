@@ -1,0 +1,112 @@
+name: Best Download, Upload to Files.ir & Send Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'Full URL of the file to download'
+        required: true
+        default: ''
+      file_name:
+        description: 'Name to save the file as (leave empty for timestamp .mp4)'
+        required: false
+        default: ''
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare filename and download
+        id: download
+        run: |
+          BASE_NAME="${{ github.event.inputs.file_name }}"
+          if [ -z "$BASE_NAME" ]; then
+            BASE_NAME="$(date +'%Y%m%d%H%M%S').mp4"
+          elif [[ "$BASE_NAME" != *"."* ]]; then
+            BASE_NAME="${BASE_NAME}.mp4"
+          fi
+          echo "FINAL_NAME=$BASE_NAME" >> $GITHUB_ENV
+          mkdir -p downloaded
+          curl -L -o "downloaded/$BASE_NAME" "${{ github.event.inputs.file_url }}"
+          echo "Downloaded:"
+          ls -lh "downloaded/$BASE_NAME"
+
+      - name: Upload to Files.ir, create shareable link, and notify via Rubika
+        env:
+          FILES_IR_TOKEN: ${{ secrets.FILES_IR_TOKEN }}
+          RUBIKA_BOT_TOKEN: ${{ secrets.RUBIKA_BOT_TOKEN }}
+          RUBIKA_CHAT_ID: ${{ secrets.RUBIKA_CHAT_ID }}
+        run: |
+          FILE_PATH="downloaded/${{ env.FINAL_NAME }}"
+          FILE_NAME="${{ env.FINAL_NAME }}"
+
+          # ---------- 1. Upload to Files.ir ----------
+          echo "Uploading to Files.ir..."
+          UPLOAD_RESP=$(curl -s -X POST "https://my.files.ir/api/v1/uploads" \
+            -H "Authorization: Bearer $FILES_IR_TOKEN" \
+            -F "file=@${FILE_PATH}")
+
+          # Debug: show response
+          echo "Upload response: $UPLOAD_RESP"
+
+          # Extract file entry ID and status
+          STATUS=$(echo "$UPLOAD_RESP" | jq -r '.status')
+          ENTRY_ID=$(echo "$UPLOAD_RESP" | jq -r '.fileEntry.id')
+          if [ "$STATUS" != "success" ] || [ -z "$ENTRY_ID" ] || [ "$ENTRY_ID" = "null" ]; then
+            echo "❌ Files.ir upload failed. Falling back to Rubika link to repo file."
+            # Fallback: send a message that upload failed and file is in repo
+            if [ -n "$RUBIKA_BOT_TOKEN" ] && [ -n "$RUBIKA_CHAT_ID" ]; then
+              REPO_URL="https://github.com/${{ github.repository }}/blob/main/downloaded/${FILE_NAME}"
+              curl -s -X POST "https://botapi.rubika.ir/v3/${RUBIKA_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${RUBIKA_CHAT_ID}\",\"text\":\"⚠️ Upload to Files.ir failed. The file is saved in the repository:\n${REPO_URL}\"}"
+            fi
+            exit 1
+          fi
+          echo "File uploaded, entry ID: $ENTRY_ID"
+
+          # ---------- 2. Create shareable link ----------
+          echo "Creating shareable link..."
+          LINK_RESP=$(curl -s -X POST "https://my.files.ir/api/v1/file-entries/${ENTRY_ID}/shareable-link" \
+            -H "Authorization: Bearer $FILES_IR_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{}')   # empty body – creates default link
+
+          echo "Share link response: $LINK_RESP"
+          LINK_STATUS=$(echo "$LINK_RESP" | jq -r '.status')
+          SHARE_HASH=$(echo "$LINK_RESP" | jq -r '.link.hash')
+          if [ "$LINK_STATUS" != "success" ] || [ -z "$SHARE_HASH" ] || [ "$SHARE_HASH" = "null" ]; then
+            echo "❌ Could not create shareable link"
+            exit 1
+          fi
+
+          # Build the downloadable link (standard Files.ir shared file URL)
+          DOWNLOAD_LINK="https://files.ir/s/${SHARE_HASH}"
+          echo "✅ Shareable link: $DOWNLOAD_LINK"
+
+          # ---------- 3. Send link to Rubika ----------
+          if [ -n "$RUBIKA_BOT_TOKEN" ] && [ -n "$RUBIKA_CHAT_ID" ]; then
+            MESSAGE="📁 ${FILE_NAME}\n🔗 ${DOWNLOAD_LINK}"
+            curl -s -X POST "https://botapi.rubika.ir/v3/${RUBIKA_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${RUBIKA_CHAT_ID}\",\"text\":\"${MESSAGE}\"}"
+            echo "Link sent to Rubika"
+          else
+            echo "Rubika secrets not set – skipping notification"
+          fi
+
+      # ---------- Commit file to repo (always) ----------
+      - name: Commit and push to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "downloaded/${{ env.FINAL_NAME }}"
+          git commit -m "Add downloaded file: downloaded/${{ env.FINAL_NAME }}" || echo "No changes to commit"
+          git push
