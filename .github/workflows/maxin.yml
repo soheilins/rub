@@ -1,0 +1,35 @@
+name: Test Files.ir Connectivity
+
+on:
+  workflow_dispatch:   # manual trigger
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check reachability (no auth)
+        run: |
+          echo "Trying to reach my.files.ir..."
+          # Basic HTTP request, fail if it takes more than 15 seconds
+          curl -sv --max-time 15 https://my.files.ir 2>&1 | head -20
+          echo "If you see an HTML page or a redirect, the domain is reachable."
+
+      - name: Test API authentication
+        env:
+          FILES_IR_TOKEN: ${{ secrets.FILES_IR_TOKEN }}
+        run: |
+          if [ -z "$FILES_IR_TOKEN" ]; then
+            echo "FILES_IR_TOKEN secret is missing. Skipping authenticated test."
+            exit 0
+          fi
+          echo "Testing authenticated API call..."
+          RESP=$(curl -s --max-time 30 \
+            -H "Authorization: Bearer $FILES_IR_TOKEN" \
+            https://my.files.ir/api/v1/user/space-usage)
+          echo "Response: $RESP"
+          STATUS=$(echo "$RESP" | jq -r '.status')
+          if [ "$STATUS" = "success" ]; then
+            echo "✅ Authentication successful – space usage info returned."
+          else
+            echo "❌ Authentication failed or API error. Token may be invalid."
+          fi
